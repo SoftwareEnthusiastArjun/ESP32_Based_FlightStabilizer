@@ -150,7 +150,7 @@ class GCS:
         ]:
             self.nb.add(frame, text=label)
 
-        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_change)
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_change) #
 
     # ── Status bar ─────────────────────────────────────────────────────
     def _build_statusbar(self):
@@ -250,11 +250,27 @@ class GCS:
             self.diag_tab.on_hide()
 
     def cleanup(self):
-        if self.servo_tab.pwm_stream_thread_started:
-            self.servo_tab.stop_pwm_stream_and_send()
-        self.diag_tab.on_hide()
-        self.vis_tab._stop()
-        self.conn.close()
+        """Called from the finally block after mainloop exits.
+        tkinter widgets may already be destroyed at this point,
+        so we only clean up threads and network connections."""
+        try:
+            if self.servo_tab.pwm_stream_thread_started:
+                self.servo_tab.stop_pwm_stream_and_send()
+        except Exception:
+            pass
+        try:
+            self.diag_tab.on_hide()
+        except Exception:
+            pass
+        try:
+            # _stop() already handles destroyed widgets gracefully
+            self.vis_tab._stop()
+        except Exception:
+            pass
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
