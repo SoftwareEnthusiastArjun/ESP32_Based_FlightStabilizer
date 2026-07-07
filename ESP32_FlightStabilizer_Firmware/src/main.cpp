@@ -79,7 +79,21 @@ const double G_SENSITIVITY = 65.5;    // must match 0x1B
 
 #define MIN_PW       999    // µs — minimum valid PWM pulse
 #define MAX_PW      1993    // µs — maximum valid PWM pulse
-#define PW_TIMEOUT  25000   // µs — pulseIn timeout
+#define PW_TIMEOUT  25000   // µs — pulseIn timeout (kept for reference; no longer used)
+
+// ── PWM INPUT — interrupt-driven capture (replaces blocking pulseIn) ──
+// Each channel has an ISR on CHANGE that records rising-edge time and
+// computes pulse width on the falling edge. All shared state is 32-bit
+// aligned → atomic on Xtensa LX6, no critical sections needed (same
+// convention as pwmPct1..pwmPct4 below). If no edge has been seen for
+// SIGNAL_TIMEOUT_US the channel is reported as 0 µs in loop(), exactly
+// matching the old pulseIn timeout behavior — so "No signal" handling
+// downstream (p4 == 0 → autopilot off, GCS shows "No signal") is unchanged.
+#define SIGNAL_TIMEOUT_US 30000UL   // 30 ms — 1.5× RC frame, replicates pulseIn(25 ms)
+static const uint8_t PWM_PINS[4] = { PITCH_IP, ROLL_IP, YAW_IP, AUTO_PILOT_IP };
+volatile uint32_t pulseRise[4]  = {0, 0, 0, 0};   // ISR-only: last rising-edge timestamp
+volatile uint32_t pulseWidth[4] = {0, 0, 0, 0};   // ISR → loop: last measured pulse width
+volatile uint32_t lastEdge[4]   = {0, 0, 0, 0};   // ISR → loop: last edge timestamp (for staleness)
 
 #define SERVO_MIN    45
 #define SERVO_MAX   135
@@ -108,7 +122,7 @@ WiFiServer   tcpServer(12345);
 // Filter coefficients
 float ACCEL_FILTER = 0.3f;
 float GYRO_FILTER  = 0.08f;
-float COMP_FILTER  = 0.7f;
+float COMP_FILTER  = 0.02f; // complementary filter: 0 = gyro-only, 1 = accel-only. now .98 gyro, .02 accel
 
 // PID deadband: errors smaller than this (degrees) are treated as zero.
 // Prevents servo hunting from sensor noise at rest.
@@ -486,6 +500,33 @@ void checkSerialConfig() {
 }
 
 // ================================================================
+//                  PWM INPUT EDGE ISR  (Core 1)
+//  One ISR shared by all 4 channels; index passed via attachInterruptArg.
+//  IRAM_ATTR is MANDATORY — flash cache is disabled during EEPROM.commit()
+//  and Wi-Fi flash ops; a non-IRAM ISR firing then crashes the chip with
+//  "Cache disabled but cached memory region accessed".
+//  micros() is backed by esp_timer_get_time() which is documented
+//  ISR-safe (no critical sections, no flash access).
+//  Reads GPIO level directly from the register — faster than digitalRead
+//  and guaranteed IRAM-resident. All PWM pins (15/16/17/18) are < 32 so
+//  GPIO.in is the correct register.
+// ================================================================
+void IRAM_ATTR pwmEdgeISR(void* arg) {
+  uint32_t idx   = (uint32_t)arg;
+  uint32_t now   = micros();
+  uint32_t level = (GPIO.in >> PWM_PINS[idx]) & 0x1;
+  if (level) {
+    pulseRise[idx] = now;                       // rising edge → start of pulse
+  } else {
+    uint32_t w = now - pulseRise[idx];          // falling edge → pulse complete
+    if (w < 3000UL) pulseWidth[idx] = w;        // sanity: ignore widths >3 ms
+                                                // (real RC pulses ≤2 ms; guards against
+                                                //  stale pulseRise if a rising edge was missed)
+  }
+  lastEdge[idx] = now;                          // any edge updates staleness timestamp
+}
+
+// ================================================================
 //                           SETUP
 // ================================================================
 void setup() {
@@ -519,11 +560,44 @@ void setup() {
   initMPU6050();
   calibrateMPU6050();
 
+  // --- Reference attitude capture ---
+  // Plane must be at rest and level here. This fixes the "home" attitude
+  // used as the PID setpoint for the ENTIRE flight (not re-captured on
+  // autopilot engagement). Warm up the complementary filter first so the
+  // averaged reference isn't contaminated by the cold-start settle.
+  Serial.println("Warming up IMU filter...");
+  for (int i = 0; i < 40; i++) { // The one-sentence summary: the filter has memory that starts at zero, so it needs a running 
+    updateMPU6050();             // start to converge on the real attitude — this loop gives it that head start during boot,
+    delay(20);                   // where the blocking cost is free, so the aircraft never stabilizes against a wrong estimate.(40 × 20 ms = 800 ms to settle settle;)
+  }
+  Serial.println("Capturing reference attitude (keep still)...");
+  {
+    const int SAMPLES = 20;
+    double sumP = 0.0, sumR = 0.0;
+    for (int i = 0; i < SAMPLES; i++) {
+      updateMPU6050();
+      float tp, tr;
+      getAngles(tp, tr);
+      sumP += tp; sumR += tr;
+      delay(20);
+    }
+    referencePitch = (float)(sumP / SAMPLES);
+    referenceRoll  = (float)(sumR / SAMPLES);
+  }
+  Serial.printf("Reference captured: pitch=%.2f roll=%.2f\n",
+                referencePitch, referenceRoll);
+
   // --- PWM inputs ---
   pinMode(PITCH_IP,    INPUT);
   pinMode(ROLL_IP,     INPUT);
   pinMode(YAW_IP,      INPUT);
   pinMode(AUTO_PILOT_IP, INPUT);
+
+  // Attach ISRs for non-blocking PWM capture (replaces pulseIn in loop())
+  for (uint32_t i = 0; i < 4; i++) {
+    attachInterruptArg(digitalPinToInterrupt(PWM_PINS[i]),
+                       pwmEdgeISR, (void*)i, CHANGE);
+  }
 
   // --- Servos ---
   pitchServo.attach(PITCH_SERVO_PIN);
@@ -562,6 +636,16 @@ void setup() {
   } else {
     Serial.println("\nWiFi failed. Flight-only mode.");
   }
+
+  // --- Armed indicator: wiggle roll servo 3× so it's visible that
+  //     setup is complete and the FC is about to enter the main loop ---
+  Serial.println("Setup complete — arming indicator.");
+  for (int i = 0; i < 3; i++) {
+    rollServo.write(SERVO_CENTER - 25); delay(150);
+    rollServo.write(SERVO_CENTER + 25); delay(150);
+  }
+  rollServo.write(SERVO_CENTER);   // return to neutral before loop starts
+  lastRollCmd = SERVO_CENTER;
 }
 
 // ================================================================
@@ -576,11 +660,15 @@ void loop() {
   // 1. Update sensor — always, every tick
   updateMPU6050();
 
-  // 2. Read PWM inputs (blocking on Core 1 only — safe)
-  uint32_t pw1 = pulseIn(PITCH_IP,      HIGH, PW_TIMEOUT);
-  uint32_t pw2 = pulseIn(ROLL_IP,       HIGH, PW_TIMEOUT);
-  uint32_t pw3 = pulseIn(YAW_IP,        HIGH, PW_TIMEOUT);
-  uint32_t pw4 = pulseIn(AUTO_PILOT_IP, HIGH, PW_TIMEOUT);
+  // 2. Read PWM inputs — non-blocking, captured by pwmEdgeISR.
+  //    If no edge has been seen for SIGNAL_TIMEOUT_US the channel is
+  //    reported as 0 µs, matching the previous pulseIn timeout behavior
+  //    (downstream: p4 == 0 → autopilot off, GCS shows "No signal").
+  uint32_t now_us = micros();
+  uint32_t pw1 = ((uint32_t)(now_us - lastEdge[0]) > SIGNAL_TIMEOUT_US) ? 0 : pulseWidth[0];
+  uint32_t pw2 = ((uint32_t)(now_us - lastEdge[1]) > SIGNAL_TIMEOUT_US) ? 0 : pulseWidth[1];
+  uint32_t pw3 = ((uint32_t)(now_us - lastEdge[2]) > SIGNAL_TIMEOUT_US) ? 0 : pulseWidth[2];
+  uint32_t pw4 = ((uint32_t)(now_us - lastEdge[3]) > SIGNAL_TIMEOUT_US) ? 0 : pulseWidth[3];
 
   int p1 = constrain(map(pw1, MIN_PW, MAX_PW, 0, 100), 0, 100);
   int p2 = constrain(map(pw2, MIN_PW, MAX_PW, 0, 100), 0, 100);
@@ -600,18 +688,8 @@ void loop() {
   // 3. Mode-transition edge detector
   if (autoActive != lastAutoState) {
     if (autoActive) {
-      // Average BIAS_CAL_SAMPLES to absorb sensor mounting offset
-      const int SAMPLES = 20;
-      double sumP = 0.0, sumR = 0.0;
-      for (int i = 0; i < SAMPLES; i++) {
-        updateMPU6050();
-        float tp, tr;
-        getAngles(tp, tr);
-        sumP += tp; sumR += tr;
-        delay(20);
-      }
-      referencePitch = (float)(sumP / SAMPLES);
-      referenceRoll  = (float)(sumR / SAMPLES);
+      // Reference attitude is fixed at startup — do NOT re-capture here.
+      // Only reset PID state so the handover into autopilot is bumpless.
       pitchOffset    = SERVO_CENTER;
       rollOffset     = SERVO_CENTER;
 
@@ -746,7 +824,7 @@ void initMPU6050() {
 void calibrateMPU6050() {
   Serial.println("Calibrating gyro (keep still)...");
   const int N = 500;
-  long sx = 0, sy = 0, sz = 0;
+  long sx = 0, sy = 0, sz = 0; // use long to avoid overflow from summing 500 int16_t samples, sx etc are sums of raw gyro readings, not averages yet
   uint8_t d[6];
   for (int i = 0; i < N; i++) {
     if (i2cRead(MPU6050_ADDR, 0x43, d, 6) == 0) {
@@ -775,11 +853,11 @@ void updateMPU6050() {
   accX = (int16_t)((d[0]  << 8) | d[1]);
   accY = (int16_t)((d[2]  << 8) | d[3]);
   accZ = (int16_t)((d[4]  << 8) | d[5]);
-  // d[6..7] = temp, skip
+  // d[6..7] = temp, skip. gyrX/Y/Z are °/s
   gyrX = ((int16_t)((d[8]  << 8) | d[9])  - gyrXoffs) / G_SENSITIVITY;
   gyrY = ((int16_t)((d[10] << 8) | d[11]) - gyrYoffs) / G_SENSITIVITY;
-  gyrZ = ((int16_t)((d[12] << 8) | d[13]) - gyrZoffs) / G_SENSITIVITY;
-
+  gyrZ = ((int16_t)((d[12] << 8) | d[13]) - gyrZoffs) / G_SENSITIVITY; // G_SENSITIVITY is the sensor's conversion factor, set by the hardware:(take, 65.5 LSB = 1°/s for example, LSB = "Least Significant Bit" = one raw unit from the sensor.
+  // So if the sensor outputs 1997: 1997 / 65.5 = 30.5°/s), but in reality 65.5 LSB/°/s == ±500°/s
   // Low-pass filter accel & gyro
   fax = fax * (1.0 - ACCEL_FILTER) + accX * ACCEL_FILTER;
   fay = fay * (1.0 - ACCEL_FILTER) + accY * ACCEL_FILTER;
@@ -796,20 +874,20 @@ void updateMPU6050() {
   double accelPitch = atan2(fax, sqrt(fay * fay + faz * faz)) * 180.0 / M_PI;
   double accelRoll  = atan2(fay, sqrt(fax * fax + faz * faz)) * 180.0 / M_PI;
 
-  // Gyro integration with actual dt
+  // Gyro integration with actual dt, this tells us how much the angle has changed since the last update according to the gyro. The gyro gives us a rate of rotation, so we multiply by dt to get an angle change, and add that to our previous angle estimate (sensorPitch, sensorRoll, sensorYaw) to get a new angle estimate based on the gyro.
   double np = sensorPitch + fgy * dt;   // Y gyro → pitch rate
   double nr = sensorRoll  + fgx * dt;   // X gyro → roll rate
   double ny = sensorYaw   + fgz * dt;   // Z gyro → yaw rate
 
   // Complementary filter
-  np = np * (1.0 - COMP_FILTER) + accelPitch * COMP_FILTER;
+  np = np * (1.0 - COMP_FILTER) + accelPitch * COMP_FILTER; //np is the new pitch estimate, which is a blend of the integrated gyro (np) and the accel angle (accelPitch), weighted by COMP_FILTER
   nr = nr * (1.0 - COMP_FILTER) + accelRoll  * COMP_FILTER;
 
   // Atomic write (spinlock protects 64-bit double writes)
   portENTER_CRITICAL(&imuLock);
   sensorPitch = np;
   sensorRoll  = nr;
-  sensorYaw   = ny;
+  sensorYaw   = ny; //not used at all now
   portEXIT_CRITICAL(&imuLock);
 }
 
